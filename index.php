@@ -54,7 +54,7 @@ if($PASSWORD) {
             $_SESSION['_sfm_allowed'] = true;
             header('Location: ?');
         }
-        echo '<html><body><form action=? method=post>PASSWORD:<input type=password name=p /></form></body></html>'; 
+        echo '<html><body><form action=? method=post>PASSWORD:<input type=password name=p />&nbsp;&nbsp;<input type="submit" value="Go"></form></body></html>'; 
         exit;
     }
 }
