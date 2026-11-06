@@ -1,32 +1,42 @@
 <?php
-/********************************
-Simple PHP File Manager
-Copyright John Campbell (jcampbell1)
-
-Liscense: MIT
-********************************/
 declare(strict_types=1);
 
 const APP_NAME = 'File Port';
 const SESSION_NAME = 'sfm_session';
 const MAX_TEXT_EDIT_BYTES = 2_000_000;
 
-$ROOT_DIR = '/var/apps-data/storage-files';
-$PASSWORD = getenv('SFM_PASSWORD') ?: 'CHANGE-ME-BEFORE-DEPLOYMENT';
+$ROOT_DIR = '/storage-files';
+$PASSWORD = getenv('SFM_PASSWORD') ?: 'yourstrongpassword';
 
 // Generate keys as below
 // openssl genpkey -algorithm RSA -out private.pem -pkeyopt rsa_keygen_bits:2048
 // openssl rsa -pubout -in private.pem -out public.pem
 
-// RSA Public Key exposed to JS (Safe for browser)
-$PUBLIC_KEY_PEM = <<<'EOD'
+// RSA Public Key for UPLOAD - exposed to JS (Safe for browser)
+$UP_PUBLIC_KEY_PEM = <<<'EOD'
 -----BEGIN PUBLIC KEY-----
 PASTE_YOUR_RSA_PUBLIC_KEY_HERE
 -----END PUBLIC KEY-----
 EOD;
 
-// RSA Private Key kept strictly on the server
-$PRIVATE_KEY_PEM = <<<'EOD'
+// RSA Private Key for UPLOAD - kept strictly on the server
+$UP_PRIVATE_KEY_PEM = <<<'EOD'
+-----BEGIN PRIVATE KEY-----
+PASTE_YOUR_RSA_PRIVATE_KEY_HERE
+-----END PRIVATE KEY-----
+EOD;
+
+// RSA Public Key for DOWNLOAD - exposed to JS (Safe for browser)
+// REPLACE WITH YOUR OWN RSA PUBLIC KEY (2048-bit or higher)
+$DOWN_PUBLIC_KEY_PEM = <<<'EOD'
+-----BEGIN PUBLIC KEY-----
+PASTE_YOUR_RSA_PUBLIC_KEY_HERE
+-----END PUBLIC KEY-----
+EOD;
+
+// RSA Private Key for DOWNLOAD - kept strictly on the server
+// REPLACE WITH YOUR OWN RSA PRIVATE KEY (matching the public key above)
+$DOWN_PRIVATE_KEY_PEM = <<<'EOD'
 -----BEGIN PRIVATE KEY-----
 PASTE_YOUR_RSA_PRIVATE_KEY_HERE
 -----END PRIVATE KEY-----
@@ -36,7 +46,7 @@ $ALLOW_UPLOAD = true;
 $ALLOW_DELETE = true;
 $ALLOW_EDIT = true;
 $ALLOW_CREATE = true;
-$MAX_UPLOAD_BYTES = 20 * 1024 * 1024; // 20 MiB
+$MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB
 $BLOCKED_EXTENSIONS = ['php', 'phtml', 'phar', 'cgi', 'pl', 'py', 'sh', 'asp', 'aspx', 'jsp'];
 $HIDDEN_EXTENSIONS = ['php', 'phtml', 'phar', 'cgi', 'pl', 'py', 'sh', 'asp', 'aspx', 'jsp'];
 
@@ -291,7 +301,7 @@ if (json_request()) {
                     $tag = substr($content, 2 + $keyLength + 12, 16);
                     $ciphertext = substr($content, 2 + $keyLength + 12 + 16);
 
-                    $privKey = openssl_pkey_get_private($PRIVATE_KEY_PEM);
+                    $privKey = openssl_pkey_get_private($UP_PRIVATE_KEY_PEM);
                     if ($privKey === false) {
                         throw new RuntimeException('Server RSA private key error.');
                     }
@@ -339,12 +349,62 @@ if (json_request()) {
                 if (is_blocked(basename($path), $HIDDEN_EXTENSIONS)) throw new RuntimeException('This file type is hidden.');
                 if (is_dir($path) || !is_file($path) || !is_readable($path)) throw new RuntimeException('File cannot be downloaded.');
                 $name = basename($path);
-                header('Content-Type: application/octet-stream');
-                header('X-Content-Type-Options: nosniff');
-                header('Content-Length: ' . filesize($path));
-                header("Content-Disposition: attachment; filename*=UTF-8''" . rawurlencode($name));
-                readfile($path);
-                exit;
+                $secure = isset($_GET['secure']) && $_GET['secure'] === '1';
+                
+                if ($secure) {
+                    // Secure download with asymmetric encryption
+                    $fileSize = filesize($path);
+                    
+                    // Warn for very large files (> 512MB) - may cause memory issues
+                    if ($fileSize > 512 * 1024 * 1024) {
+                        error_log("WARNING: Secure download requested for large file ($fileSize bytes). May cause memory issues.");
+                    }
+                    
+                    $content = file_get_contents($path);
+                    if ($content === false) throw new RuntimeException('Could not read file.');
+                    
+                    error_log("Secure download: Original size = " . strlen($content) . " bytes");
+                    
+                    // Generate random AES key
+                    $aesKey = random_bytes(32);
+                    $iv = random_bytes(12);
+                    
+                    // Encrypt file content with AES-256-GCM
+                    $tag = '';
+                    $ciphertext = openssl_encrypt($content, 'aes-256-gcm', $aesKey, OPENSSL_RAW_DATA, $iv, $tag);
+                    if ($ciphertext === false) throw new RuntimeException('Payload encryption failed.');
+                    
+                    error_log("Secure download: Encrypted size = " . strlen($ciphertext) . " bytes");
+                    
+                    // Encrypt AES key with RSA public key (for download)
+                    $pubKey = openssl_pkey_get_public($DOWN_PUBLIC_KEY_PEM);
+                    if ($pubKey === false) throw new RuntimeException('Server RSA public key error.');
+                    
+                    $encryptedKey = '';
+                    $success = openssl_public_encrypt($aesKey, $encryptedKey, $pubKey, OPENSSL_PKCS1_OAEP_PADDING);
+                    if (!$success) throw new RuntimeException('Key encryption failed.');
+                    
+                    // Build binary stream: [2 bytes key length][N bytes encrypted key][12 bytes IV][16 bytes Tag][Ciphertext]
+                    $keyLen = strlen($encryptedKey);
+                    $binaryPayload = pack('n', $keyLen) . $encryptedKey . $iv . $tag . $ciphertext;
+                    
+                    error_log("Secure download: Final payload size = " . strlen($binaryPayload) . " bytes, filename = " . $name . ".fm");
+                    
+                    header('Content-Type: application/octet-stream');
+                    header('X-Content-Type-Options: nosniff');
+                    header('Content-Length: ' . strlen($binaryPayload));
+                    header("Content-Disposition: attachment; filename*=UTF-8''" . rawurlencode($name . '.fm'));
+                    echo $binaryPayload;
+                    exit;
+                } else {
+                    // Standard download
+                    header('Content-Type: application/octet-stream');
+                    header('X-Content-Type-Options: nosniff');
+                    header('Content-Length: ' . filesize($path));
+                    header("Content-Disposition: attachment; filename*=UTF-8''" . rawurlencode($name));
+                    readfile($path);
+                    exit;
+                }
             default:
                 respond(400, ['ok'=>false, 'error'=>'Unknown action.']);
         }
@@ -382,6 +442,10 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:12px 14p
   <section class="toolbar">
     <input id="search" type="text" placeholder="Search this folder..." aria-label="Search files">
     <?php if ($ALLOW_CREATE): ?><button id="newFolder">New folder</button><button id="newFile">New text file</button><?php endif; ?>
+    <label style="display:flex;align-items:center;gap:6px;white-space:nowrap">
+      <input type="checkbox" id="secureDownload" style="width:auto">
+      <span>Secure Download</span>
+    </label>
     <?php if ($ALLOW_UPLOAD): ?>
       <div id="file_drop_target">
         Drop files here or <input type="file" id="upload" multiple style="display:inline-block">
@@ -389,6 +453,7 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:12px 14p
     <?php endif; ?>
   </section>
   <div id="upload_progress"></div>
+  <div id="download_progress"></div>
   <section class="panel">
     <div class="crumb" id="crumb">Loading...</div>
     <div style="overflow-x:auto"><table><thead><tr><th data-sort="name">Name ↕</th><th class="hide-mobile" data-sort="size">Size ↕</th><th class="hide-mobile" data-sort="mtime">Modified ↕</th><th>Actions</th></tr></thead><tbody id="rows"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody></table></div>
@@ -400,7 +465,8 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:12px 14p
 'use strict';
 const CSRF = <?= json_encode($csrf) ?>;
 const MAX_UPLOAD_BYTES = <?= (int)$MAX_UPLOAD_BYTES ?>;
-const RSA_PUBLIC_KEY_PEM = <?= json_encode($PUBLIC_KEY_PEM) ?>;
+const UP_RSA_PUBLIC_KEY_PEM = <?= json_encode($UP_PUBLIC_KEY_PEM) ?>;
+const DOWN_RSA_PRIVATE_KEY_PEM = <?= json_encode($DOWN_PRIVATE_KEY_PEM) ?>;
 const rows = document.getElementById('rows');
 const statusBox = document.getElementById('status');
 let currentPath = '';
@@ -489,7 +555,7 @@ function render() {
     const modified=document.createElement('td'); modified.className='hide-mobile'; modified.textContent=new Date(item.mtime*1000).toLocaleString();
     const actions=document.createElement('td'); actions.className='actions';
     if (!item.dir) {
-      const download=document.createElement('button'); download.textContent='Download'; download.onclick=()=>{location.href=location.pathname+'?api=download&path='+encodeURIComponent(item.path)}; actions.append(download);
+      const download=document.createElement('button'); download.textContent='Download'; download.onclick=()=>downloadFile(item); actions.append(download);
       if (item.name.toLowerCase().endsWith('.txt')) {
         const edit=document.createElement('button'); edit.textContent='Edit'; edit.onclick=()=>openEditor(item.path); actions.append(edit);
       }
@@ -572,7 +638,7 @@ async function importRsaPublicKey(pem) {
 }
 
 async function hybridEncrypt(fileBuffer, rsaPublicKeyPem) {
-  // 1. Generate random AES-1 key for symmetric payload encryption
+  // 1. Generate random AES-256 key for symmetric payload encryption
   const aesRawKey = window.crypto.getRandomValues(new Uint8Array(32));
   const aesKey = await window.crypto.subtle.importKey(
     'raw', aesRawKey, { name: 'AES-GCM' }, false, ['encrypt']
@@ -617,6 +683,175 @@ async function hybridEncrypt(fileBuffer, rsaPublicKeyPem) {
   return combined;
 }
 
+function pemToPrivateKeyArrayBuffer(pem) {
+  const b64 = pem.replace(/-----\w+ PRIVATE KEY-----/g, '').replace(/\s+/g, '');
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+async function importRsaPrivateKey(pem) {
+  const binaryDer = pemToPrivateKeyArrayBuffer(pem);
+  return window.crypto.subtle.importKey(
+    'pkcs8',
+    binaryDer,
+    { name: 'RSA-OAEP', hash: 'SHA-1' },
+    false,
+    ['decrypt']
+  );
+}
+
+async function hybridDecrypt(encryptedBuffer, rsaPrivateKeyPem) {
+  const data = new Uint8Array(encryptedBuffer);
+  
+  // Parse binary layout: [2 bytes key length][N bytes encrypted key][12 bytes IV][16 bytes Tag][Ciphertext]
+  const keyLength = (data[0] << 8) | data[1];
+  const encryptedAesKey = data.slice(2, 2 + keyLength);
+  const iv = data.slice(2 + keyLength, 2 + keyLength + 12);
+  const tag = data.slice(2 + keyLength + 12, 2 + keyLength + 12 + 16);
+  const ciphertext = data.slice(2 + keyLength + 12 + 16);
+
+  // 1. Decrypt AES key with RSA Private Key
+  const rsaKey = await importRsaPrivateKey(rsaPrivateKeyPem);
+  const aesRawKey = await window.crypto.subtle.decrypt(
+    { name: 'RSA-OAEP' },
+    rsaKey,
+    encryptedAesKey
+  );
+
+  // 2. Import AES key
+  const aesKey = await window.crypto.subtle.importKey(
+    'raw', aesRawKey, { name: 'AES-GCM' }, false, ['decrypt']
+  );
+
+  // 3. Combine ciphertext and tag for decryption
+  const combined = new Uint8Array(ciphertext.length + tag.length);
+  combined.set(ciphertext, 0);
+  combined.set(tag, ciphertext.length);
+
+  // 4. Decrypt payload
+  const decrypted = await window.crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: iv },
+    aesKey,
+    combined
+  );
+
+  return decrypted;
+}
+
+async function downloadFile(item) {
+  const secureDownload = document.getElementById('secureDownload').checked;
+  
+  if (!secureDownload) {
+    // Standard download
+    location.href = location.pathname + '?api=download&path=' + encodeURIComponent(item.path);
+    return;
+  }
+
+  // Warn for large files in secure mode
+  if (item.size && item.size > 512 * 1024 * 1024) {
+    if (!confirm('This file is ' + prettySize(item.size) + '. Secure download of large files may fail due to browser memory limits. Continue?')) {
+      return;
+    }
+  }
+
+  // Secure download with decryption and progress
+  const progressContainer = document.getElementById('download_progress');
+  const row = document.createElement('div');
+  const nameSpan = document.createElement('span');
+  nameSpan.textContent = item.name;
+  const track = document.createElement('div');
+  track.className = 'progress_track';
+  const fill = document.createElement('div');
+  fill.className = 'progress';
+  track.appendChild(fill);
+  const statusSpan = document.createElement('span');
+  statusSpan.textContent = 'Starting...';
+  row.appendChild(nameSpan);
+  row.appendChild(track);
+  row.appendChild(statusSpan);
+  progressContainer.appendChild(row);
+
+  try {
+    notify('Downloading and decrypting ' + item.name + '...');
+    
+    console.log('[Secure Download] Starting download for:', item.name);
+    
+    const response = await fetch(
+      location.pathname + '?api=download&path=' + encodeURIComponent(item.path) + '&secure=1',
+      { credentials: 'same-origin' }
+    );
+    
+    if (!response.ok) {
+      throw new Error('Download failed: ' + response.statusText);
+    }
+
+    const contentLength = response.headers.get('Content-Length');
+    const total = contentLength ? parseInt(contentLength, 10) : 0;
+    
+    console.log('[Secure Download] Content-Length:', total, 'bytes');
+    
+    const reader = response.body.getReader();
+    const chunks = [];
+    let loaded = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      
+      chunks.push(value);
+      loaded += value.length;
+      
+      if (total > 0) {
+        const percent = Math.round((loaded / total) * 100);
+        fill.style.width = percent + '%';
+        statusSpan.textContent = prettySize(loaded) + ' / ' + prettySize(total);
+      } else {
+        statusSpan.textContent = prettySize(loaded);
+      }
+    }
+
+    console.log('[Secure Download] Downloaded', loaded, 'bytes (encrypted)');
+    statusSpan.textContent = 'Decrypting...';
+    fill.style.width = '100%';
+
+    // Combine chunks into single buffer
+    const encryptedBuffer = new Uint8Array(loaded);
+    let position = 0;
+    for (const chunk of chunks) {
+      encryptedBuffer.set(chunk, position);
+      position += chunk.length;
+    }
+
+    console.log('[Secure Download] Starting decryption...');
+    const decryptedBuffer = await hybridDecrypt(encryptedBuffer.buffer, DOWN_RSA_PRIVATE_KEY_PEM);
+    console.log('[Secure Download] Decrypted size:', decryptedBuffer.byteLength, 'bytes');
+
+    // Trigger download of decrypted file
+    const blob = new Blob([decryptedBuffer], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = item.name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    statusSpan.textContent = 'Complete';
+    setTimeout(() => row.remove(), 2000);
+    notify('Successfully downloaded and decrypted ' + item.name);
+    console.log('[Secure Download] Complete:', item.name);
+  } catch (err) {
+    console.error('[Secure Download] Error:', err);
+    statusSpan.textContent = 'Failed';
+    statusSpan.style.color = 'var(--danger)';
+    notify('Download/decryption failed: ' + err.message, true);
+    setTimeout(() => row.remove(), 5000);
+  }
+}
+
 function uploadFile(file) {
   if (file.size > MAX_UPLOAD_BYTES) {
     notify('File ' + file.name + ' exceeds max upload size.', true);
@@ -639,7 +874,7 @@ function uploadFile(file) {
 
   file.arrayBuffer().then(async (buffer) => {
     try {
-      const encryptedBytes = await hybridEncrypt(buffer, RSA_PUBLIC_KEY_PEM);
+      const encryptedBytes = await hybridEncrypt(buffer, UP_RSA_PUBLIC_KEY_PEM);
       const maskedFileName = file.name + '.fm';
       const blob = new Blob([encryptedBytes], { type: 'application/octet-stream' });
 
